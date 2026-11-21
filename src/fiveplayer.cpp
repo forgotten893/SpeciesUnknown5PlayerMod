@@ -319,9 +319,6 @@ static PropInfo FindProperty(uintptr_t ustruct, const char* name)
 static const char* kTargetClasses[] = {
     "BP_MyGameInstance_C",
     "BP_LobbyGameMode_C",
-    "UMG_SessionRow_C",
-    "UMG_SessionInfos_C",
-    "WBP_TitleScreen_PublicSessionPage_C",
     "BP_Character_Lobby_C",
     "WBP_ScorePage_C",
     "BP_PlayerShip_C",
@@ -342,7 +339,7 @@ static const char* kEngineClasses[] = {
     "Actor",
 };
 static const char* kEngineFuncOwners[] = {
-    "WidgetBlueprintLibrary", "GameplayStatics", "PanelWidget", "CanvasPanel", "VerticalBoxSlot", "Actor",
+    "WidgetBlueprintLibrary", "GameplayStatics", "PanelWidget", "CanvasPanel", "VerticalBoxSlot", "Actor", "Widget",
 };
 static std::unordered_map<std::string, uintptr_t> g_engineClasses;   // lower-case name -> UClass*
 static std::unordered_map<std::string, uintptr_t> g_engineCDOs;      // lower-case name -> CDO
@@ -355,6 +352,8 @@ static uintptr_t g_kismetMath = 0;
 static uintptr_t g_kismetArray = 0;
 static std::vector<uintptr_t> g_gameInstances;  // includes the CDO
 static int g_shipInstances = 0;
+// 5-player mode is only for private lobbies: the host's GameInstance.isPlayerLobbyPrivate decides.
+static volatile bool g_isPrivate = false;
 static int g_scanned = 0;
 
 static void ProcessObject(uintptr_t o)
@@ -622,6 +621,11 @@ static int PatchOpenSlotFour(uintptr_t fn)
 // so dropping the Clear() does not change behaviour.
 // The 5th call needs a writable "Chair" reference; it uses SpawnSingleChair's own 'Chair' parameter
 // property as a local at offset 0 of SpawnChairs' frame, whose size is raised from 0 to 8 bytes.
+// Original SpawnChairs, saved when we patch it, so public lobbies can get the original 4 seats back.
+static uintptr_t g_seatOrigFn = 0;
+static uint8_t g_seatOrig[172];
+static int16_t g_seatOrigAlign = 0;
+
 static int PatchFifthSeat(uintptr_t shipCls)
 {
     uintptr_t spawnChairs = Func(shipCls, "SpawnChairs");
@@ -680,6 +684,10 @@ static int PatchFifthSeat(uintptr_t shipCls)
         return kFail;
     }
 
+    memcpy(g_seatOrig, b, sizeof(b));
+    g_seatOrigAlign = minAlign;
+    g_seatOrigFn = spawnChairs;
+
     uint8_t nb[172];
     memset(nb, 0x0B, sizeof(nb));  // EX_Nothing
     int p = 0;
@@ -700,6 +708,27 @@ static int PatchFifthSeat(uintptr_t shipCls)
     int16_t newAlign = minAlign < 8 ? 8 : minAlign;
     if (!SafeWrite(minAlignAddr, &newAlign, 2) || !SafeWrite(propsSizeAddr, &newSize, 4)) return kFail;
     if (!SafeWrite(s.data, nb, sizeof(nb))) return kFail;
+    return kDone;
+}
+
+// Put the original 4-seat SpawnChairs back (and its empty frame).
+static int RestoreSpawnChairs(uintptr_t shipCls)
+{
+    uintptr_t spawnChairs = Func(shipCls, "SpawnChairs");
+    uintptr_t spawnSingle = Func(shipCls, "SpawnSingleChair");
+    if (!spawnChairs || !spawnSingle) return kRetry;
+    ScriptArr s;
+    int r = ReadyScript(spawnChairs, 172, s);
+    if (r != kDone) return r;
+    uint8_t b[172];
+    if (!SafeCopy(b, s.data, sizeof(b))) return kRetry;
+    bool patched = b[0] == 0x46 && b[28] == 0x46 && b[112] == 0x46 && GetPtr(&b[1]) == spawnSingle;
+    if (!patched) return kDone;
+    if (g_seatOrigFn != spawnChairs) { Log("  seat: original SpawnChairs not saved, cannot remove the 5th seat"); return kFail; }
+    uintptr_t propsSizeAddr = spawnChairs + g_scriptOff - 8, minAlignAddr = spawnChairs + g_scriptOff - 4;
+    int32_t zero = 0;
+    if (!SafeWrite(s.data, g_seatOrig, sizeof(g_seatOrig))) return kFail;
+    if (!SafeWrite(propsSizeAddr, &zero, 4) || !SafeWrite(minAlignAddr, &g_seatOrigAlign, 2)) return kFail;
     return kDone;
 }
 
@@ -895,6 +924,28 @@ static int Combine(std::vector<Step>& steps, const char* cls)
 
 #include "scaling.inc"
 
+// BP_MyGameInstance_C::CheckAllowConnectionLobby @959 (37 bytes):
+//   Count = Conv_Int64ToInt(self.playerLobbyCapacity)  ->  Conv_Int64ToInt(5)
+// The joiner's own capacity follows its own (non-)private setting, but this pre-join check (the rejoin
+// whitelist loop) must always look at all 5 slots of the lobby it is joining. Harmless for 4-slot lobbies.
+static int PatchJoinCheckSlots(uintptr_t fn)
+{
+    const int size = 1802, stmt = 959;
+    ScriptArr s;
+    int r = ReadyScript(fn, size, s);
+    if (r != kDone) return r;
+    uint8_t b[37];
+    if (!SafeCopy(b, s.data + stmt, sizeof(b))) return kRetry;
+    if (b[0] != 0x0F || b[9] != 0x00 || b[18] != 0x68 || b[36] != 0x16) return kFail;
+    if (!IEq(ObjName(GetPtr(&b[19])), "Conv_Int64ToInt")) return kFail;
+    int64_t five = 5;
+    if (b[27] == 0x35 && memcmp(&b[28], &five, 8) == 0) return kDone;
+    if (b[27] != 0x01) return kFail;
+    if (!PropIs(&b[28], "playerLobbyCapacity")) return kRetry;
+    uint8_t nb[9]; nb[0] = 0x35; memcpy(nb + 1, &five, 8);       // EX_Int64Const 5
+    return SafeWrite(s.data + stmt + 27, nb, 9) ? kDone : kFail;
+}
+
 static int PatchSimple(const char* clsName, uintptr_t cls)
 {
     std::vector<Step> st;
@@ -902,17 +953,9 @@ static int PatchSimple(const char* clsName, uintptr_t cls)
     std::string c = clsName;
     if (c == "BP_MyGameInstance_C") {
         st.push_back({ "lobby creation opens member slot 4", PatchOpenSlotFour(F("Make Player Lobby Transaction")) });
+        st.push_back({ "joining/rejoining checks 5 slots", PatchJoinCheckSlots(F("CheckAllowConnectionLobby")) });
     } else if (c == "BP_LobbyGameMode_C") {
         st.push_back({ "lobby 'more than 4 players' check -> 5", PatchIntConst(F("Check More Than 4Players"), 2296, 435, 34, 4, 5) });
-    } else if (c == "UMG_SessionRow_C") {
-        st.push_back({ "session row full at 4 -> 5", PatchIntConst(F("ExecuteUbergraph_UMG_SessionRow"), 2037, 971, 34, 4, 5) });
-    } else if (c == "UMG_SessionInfos_C") {
-        st.push_back({ "session info full at 4 -> 5", PatchIntConst(F("ExecuteUbergraph_UMG_SessionInfos"), 3383, 2972, 34 + 9, 4, 5) });
-        st.push_back({ "join warning full at 4 -> 5", PatchIntConst(F("SetTextJoinWarning"), 682, 507, 43, 4, 5) });
-    } else if (c == "WBP_TitleScreen_PublicSessionPage_C") {
-        st.push_back({ "session member slots 0..3 -> 0..4", PatchIntConst(F("ExecuteUbergraph_WBP_TitleScreen_PublicSessionPage"), 21339, 12111, 34, 3, 4) });
-        st.push_back({ "whitelist slots 0..3 -> 0..4", PatchIntConst(F("ReorderLobbyList"), 4325, 285, 34, 3, 4) });
-        st.push_back({ "lobby list full at 4 -> 5", PatchIntConst(F("ReorderLobbyList"), 4325, 1452, 34, 4, 5) });
     } else if (c == "BP_Character_Lobby_C") {
         st.push_back({ "lobby spawn point for player 5", PatchSwapNotEqualToLess(F("_GetPlayerStartFromId"), 2031, 956) });
     } else if (c == "WBP_ScorePage_C") {
@@ -921,7 +964,7 @@ static int PatchSimple(const char* clsName, uintptr_t cls)
     } else if (c == "WBP_PauseMenu_CrewMembers_C") {
         uintptr_t ug = F("ExecuteUbergraph_WBP_PauseMenu_CrewMembers");
         st.push_back({ "crew panel hides 5 action popups", PatchIntConst(ug, kCrewUgSize, 98, 34, 3, 4) });
-        st.push_back({ "crew panel 5th row hook", PrepareCrewRow(cls) });
+        st.push_back({ "crew panel 5th row hook (shown in 5-player lobbies)", PrepareCrewRow(cls) });
     } else if (c == "BP_Seat_C") {
         st.push_back({ "seat 5 linked to the ship on other players' machines", PrepareSeatHook(cls) });
     } else if (c == "BP_MyPlayerController_C") {
@@ -935,17 +978,35 @@ static int PatchSimple(const char* clsName, uintptr_t cls)
 }
 
 static int g_shipFallback = -1;   // -1 undecided, 0 not used, 1 used (decided on the first successful patch)
+static int g_shipMode = -1;       // mode PatchShip last ran in: 1 = 5 seats (hosting a private lobby), 0 = 4 seats
+static bool g_noReloadLog = false;
 static int PatchShip(uintptr_t cls)
 {
+    bool priv = g_isPrivate;
+    if (g_shipMode != (int)priv) {
+        if (g_shipMode >= 0) {
+            Log(priv ? "Shuttle: 5th seat on (hosting a private lobby)" : "Shuttle: original 4 seats (not hosting a private lobby)");
+            g_noReloadLog = true;
+        }
+        g_shipMode = priv;
+    }
+    // The seat-screen list works with any number of seats; guests also need it in private lobbies
+    // (they can't tell private from public), so it is applied in both modes.
+    int cl = PatchChairLocal(cls);
+    if (cl == kRetry) return kRetry;
+    std::vector<Step> st;
+    if (!priv) {
+        // Public lobby, menus, or a guest (seats are spawned by the host only): original 4 seats.
+        int r = RestoreSpawnChairs(cls);
+        if (r == kRetry) return kRetry;
+        st.push_back({ "original 4 shuttle seats (not hosting a private lobby)", r });
+        st.push_back({ "seat screens use every spawned seat", cl });
+        return Combine(st, "BP_PlayerShip_C");
+    }
     int seat = PatchFifthSeat(cls);
     if (seat == kRetry) return kRetry;
-    std::vector<Step> st;
-    st.push_back({ "5th shuttle seat", seat });
-    if (seat == kDone) {
-        int cl = PatchChairLocal(cls);
-        if (cl == kRetry) return kRetry;
-        st.push_back({ "5th seat included in seat-screen updates", cl });
-    }
+    st.push_back({ "5th shuttle seat (private lobby)", seat });
+    st.push_back({ "seat screens use every spawned seat", cl });
     bool needFallback = g_shipFallback >= 0 ? g_shipFallback == 1 : (seat != kDone || g_shipInstances > 0);
     if (g_shipFallback < 0 && seat == kDone && g_shipInstances > 0)
         Log("  a shuttle already existed before the seat patch; it only has 4 seats, enabling launch-with-4 fallback");
@@ -960,9 +1021,10 @@ static int PatchShip(uintptr_t cls)
     return res;
 }
 
-// playerLobbyCapacity lives on the GameInstance; set it on the CDO and on the live instance.
+// playerLobbyCapacity lives on the GameInstance: 5 while hosting/setting up a private lobby, else 4.
 static uintptr_t g_capClass = 0;
 static int32_t g_capOffset = -1;
+static int32_t g_privOffset = -1;
 static std::unordered_set<uintptr_t> g_capLogged;
 
 static void PatchLobbyCapacity()
@@ -993,17 +1055,26 @@ static void PatchLobbyCapacity()
         int32_t propsSize = R<int32_t>(cls + g_scriptOff - 8);
         if (!pi.prop || pi.elementSize != 8 || pi.arrayDim != 1 || pi.offset < 0x28 || pi.offset + 8 > propsSize)
             return fail("property missing or unexpected", pi.elementSize, pi.arrayDim, pi.offset, propsSize);
+        PropInfo pv = FindProperty(cls, "isPlayerLobbyPrivate");
+        if (!pv.prop || pv.elementSize != 1 || pv.offset < 0x28 || pv.offset >= propsSize)
+            return fail("isPlayerLobbyPrivate missing or unexpected", pv.elementSize, pv.offset, propsSize, 0);
         g_capOffset = pi.offset;
-        Log("playerLobbyCapacity at offset 0x%x", g_capOffset);
+        g_privOffset = pv.offset;
+        Log("playerLobbyCapacity at offset 0x%x, isPlayerLobbyPrivate at 0x%x", g_capOffset, g_privOffset);
     }
     for (uintptr_t o : g_gameInstances) {
-        if (ObjClass(o) != cls) continue;
+        if (ObjClass(o) != cls || (ObjFlags(o) & RF_ClassDefaultObject)) continue;   // the live GameInstance
+        bool priv = R<uint8_t>(o + g_privOffset, 0) != 0;
+        if (priv != g_isPrivate) {
+            g_isPrivate = priv;
+            Log(priv ? "Private lobby: 5-player mode ON" : "Not a private lobby: normal 4-player mode");
+        }
         int64_t v = R<int64_t>(o + g_capOffset, -1);
-        if (v == 4) {
-            int64_t nv = kTargetPlayers;
-            if (SafeWrite(o + g_capOffset, &nv, 8) && g_capLogged.insert(o).second)
-                Log("%s: playerLobbyCapacity %lld -> %lld", ObjName(o).c_str(), (long long)v, (long long)nv);
-        } else if (v != kTargetPlayers && g_capLogged.insert(o).second) {
+        int64_t want = priv ? kTargetPlayers : 4;
+        if ((v == 4 || v == kTargetPlayers) && v != want) {
+            SafeWrite(o + g_capOffset, &want, 8);
+            Log("  playerLobbyCapacity %lld -> %lld", (long long)v, (long long)want);
+        } else if (v != 4 && v != kTargetPlayers && g_capLogged.insert(o).second) {
             Log("%s: playerLobbyCapacity is %lld (expected 4), left unchanged", ObjName(o).c_str(), (long long)v);
         }
     }
@@ -1055,7 +1126,8 @@ static DWORD WINAPI ModThread(LPVOID)
                     g_quiet = true;
                     int rr = kv.first == "BP_PlayerShip_C" ? PatchShip(kv.second) : PatchSimple(kv.first.c_str(), kv.second);
                     g_quiet = false;
-                    if (g_writeCount != before) Log("%s was reloaded; patches re-applied (%s)", kv.first.c_str(), ResultStr(rr));
+                    if (g_writeCount != before && !g_noReloadLog) Log("%s was reloaded; patches re-applied (%s)", kv.first.c_str(), ResultStr(rr));
+                    g_noReloadLog = false;
                     continue;
                 }
             }

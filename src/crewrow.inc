@@ -19,8 +19,10 @@ using ProcessEventFn = void (*)(void* obj, void* fn, void* parms);
 
 struct CrewCtx {
     bool ready = false;
-    uintptr_t crewCls = 0, constructFn = 0, ubergraph = 0;
-    NativeFn origConstruct = nullptr;
+    uintptr_t crewCls = 0, constructFn = 0, ubergraph = 0, updatePlayersFn = 0;
+    NativeFn origConstruct = nullptr, origUpdatePlayers = nullptr;
+    int32_t offPlayerInSlot = -1;                       // PlayerInfos.playerInSlot (PlayerState)
+    uintptr_t fnSetVisibility = 0;
     int32_t offInfos1 = -1, offActions1 = -1;          // crew instance vars
     int32_t offInfosIdx = -1, offActionsIdx = -1;      // PlayerIndex in the row widget classes
     uintptr_t clsCanvas = 0, clsScaleBox = 0, clsOverlay = 0;
@@ -249,6 +251,57 @@ static bool BuildFifthRow(uintptr_t crew)
     return true;
 }
 
+// The 5th row is only shown in a 5-player lobby: when we host a private lobby, or when a player
+// actually sits in slot 4 (a guest can't tell a private lobby from a public one, but public lobbies
+// never have a 5th player). Otherwise it is collapsed and the panel looks exactly like the original.
+static uintptr_t FindFifthRow(uintptr_t crew, uintptr_t* infosOut, uint8_t* shownVis)
+{
+    CrewCtx& c = g_crew;
+    uintptr_t infos1 = R<uintptr_t>(crew + c.offInfos1);
+    uintptr_t cp1 = ParentPanel(ParentPanel(infos1)), vbox = ParentPanel(cp1);
+    if (!Plausible(infos1) || ObjClass(cp1) != c.clsCanvas || !Plausible(vbox)) return 0;
+    *shownVis = R<uint8_t>(cp1 + c.offVisibility, 0);
+    ScriptArr slots;
+    if (!SafeCopy(&slots, vbox + 0x178, sizeof(slots)) || slots.num < 5 || slots.num > 16) return 0;
+    for (int i = 4; i < slots.num; i++) {
+        uintptr_t row = R<uintptr_t>(R<uintptr_t>(slots.data + 8 * i) + 0x30);
+        if (ObjClass(row) != c.clsCanvas) continue;
+        ScriptArr kids, a;
+        if (!SafeCopy(&kids, row + 0x178, sizeof(kids)) || kids.num != 2) continue;
+        uintptr_t sb = R<uintptr_t>(R<uintptr_t>(kids.data) + 0x30);
+        if (!SafeCopy(&a, sb + 0x178, sizeof(a)) || a.num != 1) continue;
+        uintptr_t inf = R<uintptr_t>(R<uintptr_t>(a.data) + 0x30);
+        if (ObjClass(inf) == ObjClass(infos1) && R<int32_t>(inf + c.offInfosIdx) == 4) { *infosOut = inf; return row; }
+    }
+    return 0;
+}
+
+static void ApplyRowVisibility(uintptr_t crew)
+{
+    CrewCtx& c = g_crew;
+    uintptr_t infos = 0;
+    uint8_t shownVis = 0;
+    uintptr_t row = FindFifthRow(crew, &infos, &shownVis);
+    if (!row) return;
+    bool occupied = c.offPlayerInSlot >= 0 && Plausible(R<uintptr_t>(infos + c.offPlayerInSlot));
+    uint8_t want = (g_isPrivate || occupied) ? shownVis : 1;   // ESlateVisibility::Collapsed
+    if (R<uint8_t>(row + c.offVisibility, want) == want) return;
+    uint8_t p[8] = { want };
+    CallUFunction(row, c.fnSetVisibility, p);
+}
+
+static void CrewVisibilityBody(uintptr_t ctx)
+{
+    __try { if (g_peIndex >= 0) ApplyRowVisibility(ctx); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("  crew row: exception 0x%08x while updating visibility", GetExceptionCode()); }
+}
+
+static void CrewUpdatePlayersThunk(void* ctx, void* stack, void* result)
+{
+    ((NativeFn)g_processInternal)(ctx, stack, result);
+    if (g_crew.ready && ObjClass((uintptr_t)ctx) == g_crew.crewCls) CrewVisibilityBody((uintptr_t)ctx);
+}
+
 static bool CrewConstructBody(uintptr_t ctx)
 {
     __try {
@@ -263,8 +316,10 @@ static bool CrewConstructBody(uintptr_t ctx)
 
 static void CrewConstructThunk(void* ctx, void* stack, void* result)
 {
-    if (g_crew.ready && ObjClass((uintptr_t)ctx) == g_crew.crewCls) CrewConstructBody((uintptr_t)ctx);
-    g_crew.origConstruct(ctx, stack, result);
+    bool ours = g_crew.ready && ObjClass((uintptr_t)ctx) == g_crew.crewCls;
+    if (ours) CrewConstructBody((uintptr_t)ctx);
+    ((NativeFn)g_processInternal)(ctx, stack, result);
+    if (ours) CrewVisibilityBody((uintptr_t)ctx);
 }
 
 static int32_t PropOff(uintptr_t st, const char* name, int32_t expectSize = 0)
@@ -311,15 +366,17 @@ static bool EnsureFuncOffset(uintptr_t bpCls, uintptr_t anyBpFn)
 static int PrepareCrewRow(uintptr_t crewCls)
 {
     if (g_crew.ready && g_crew.crewCls == crewCls &&
-        R<uintptr_t>(g_crew.constructFn + g_funcFuncOff) == (uintptr_t)&CrewConstructThunk)
+        R<uintptr_t>(g_crew.constructFn + g_funcFuncOff) == (uintptr_t)&CrewConstructThunk &&
+        R<uintptr_t>(g_crew.updatePlayersFn + g_funcFuncOff) == (uintptr_t)&CrewUpdatePlayersThunk)
         return kDone;
     CrewCtx c;
     c.crewCls = crewCls;
     c.constructFn = Func(crewCls, "Construct");
+    c.updatePlayersFn = Func(crewCls, "UpdatePlayers");
     c.ubergraph = Func(crewCls, "ExecuteUbergraph_WBP_PauseMenu_CrewMembers");
     auto infosIt = g_classes.find("WBP_PauseMenu_PlayerInfos_C");
     auto actionsIt = g_classes.find("WBP_PauseMenu_PlayerActions_C");
-    if (!c.constructFn || !c.ubergraph || infosIt == g_classes.end() || actionsIt == g_classes.end()) return kRetry;
+    if (!c.constructFn || !c.ubergraph || !c.updatePlayersFn || infosIt == g_classes.end() || actionsIt == g_classes.end()) return kRetry;
     ScriptArr s;
     int r = ReadyScript(c.ubergraph, kCrewUgSize, s);
     if (r != kDone) return r;
@@ -339,11 +396,12 @@ static int PrepareCrewRow(uintptr_t crewCls)
     c.fnVbSetSize = F("VerticalBoxSlot", "SetSize");
     c.fnVbSetHAlign = F("VerticalBoxSlot", "SetHorizontalAlignment");
     c.fnVbSetVAlign = F("VerticalBoxSlot", "SetVerticalAlignment");
+    c.fnSetVisibility = F("Widget", "SetVisibility");
     auto cdo = [&](const char* n) -> uintptr_t { auto it = g_engineCDOs.find(Lower(n)); return it == g_engineCDOs.end() ? 0 : it->second; };
     c.cdoWidgetLib = cdo("WidgetBlueprintLibrary"); c.cdoGameplayStatics = cdo("GameplayStatics");
     if (!c.clsCanvas || !c.clsScaleBox || !c.clsOverlay || !clsWidget || !clsCps || !clsOs || !clsSbs || !clsVbs ||
         !c.fnCreate || !c.fnSpawnObject || !c.fnAddChild || !c.fnAddChildToCanvas || !c.fnVbSetPadding ||
-        !c.fnVbSetSize || !c.fnVbSetHAlign || !c.fnVbSetVAlign || !c.cdoWidgetLib || !c.cdoGameplayStatics)
+        !c.fnVbSetSize || !c.fnVbSetHAlign || !c.fnVbSetVAlign || !c.fnSetVisibility || !c.cdoWidgetLib || !c.cdoGameplayStatics)
         return kRetry;
 
     // Parameter layouts of the engine functions we call (verified, not assumed).
@@ -355,7 +413,8 @@ static int PrepareCrewRow(uintptr_t crewCls)
         PropOff(c.fnAddChild, "Content", 8) == 0 && PropOff(c.fnAddChild, "ReturnValue", 8) == 8 &&
         PropOff(c.fnAddChildToCanvas, "Content", 8) == 0 && PropOff(c.fnAddChildToCanvas, "ReturnValue", 8) == 8 &&
         PropOff(c.fnVbSetPadding, "InPadding", 16) == 0 && PropOff(c.fnVbSetSize, "InSize", 8) == 0 &&
-        PropOff(c.fnVbSetHAlign, "InHorizontalAlignment", 1) == 0 && PropOff(c.fnVbSetVAlign, "InVerticalAlignment", 1) == 0;
+        PropOff(c.fnVbSetHAlign, "InHorizontalAlignment", 1) == 0 && PropOff(c.fnVbSetVAlign, "InVerticalAlignment", 1) == 0 &&
+        PropOff(c.fnSetVisibility, "InVisibility", 1) == 0;
     if (!ok) { Log("  crew row: engine function parameters unexpected"); return kFail; }
 
     c.offInfos1 = PropOff(crewCls, "WBP_PauseMenu_PlayerInfos_1", 8);
@@ -363,6 +422,8 @@ static int PrepareCrewRow(uintptr_t crewCls)
     c.offInfosIdx = PropOff(infosIt->second, "PlayerIndex", 4);
     c.offActionsIdx = PropOff(actionsIt->second, "PlayerIndex", 4);
     c.offVisibility = PropOff(clsWidget, "Visibility", 1);
+    c.offPlayerInSlot = PropOff(infosIt->second, "playerInSlot", 8);
+    if (c.offPlayerInSlot < 0) { Log("  crew row: playerInSlot not found"); return kFail; }
     {
         uintptr_t infosUg = Func(infosIt->second, "ExecuteUbergraph_WBP_PauseMenu_PlayerInfos");
         c.offUberFrame = PropOff(infosIt->second, "UberGraphFrame", 8);
@@ -394,11 +455,16 @@ static int PrepareCrewRow(uintptr_t crewCls)
     }
 
     if (!EnsureFuncOffset(crewCls, c.ubergraph)) return kRetry;
-    uintptr_t cur = R<uintptr_t>(c.constructFn + g_funcFuncOff);
-    if (cur != g_processInternal || R<uintptr_t>(c.ubergraph + g_funcFuncOff) != g_processInternal) return kRetry;  // not linked yet
-    c.origConstruct = (NativeFn)cur;
+    // Only hook functions that are linked (Func == ProcessInternal) or already carry our thunk.
+    uintptr_t thunk1 = (uintptr_t)&CrewConstructThunk, thunk2 = (uintptr_t)&CrewUpdatePlayersThunk;
+    uintptr_t cur1 = R<uintptr_t>(c.constructFn + g_funcFuncOff), cur2 = R<uintptr_t>(c.updatePlayersFn + g_funcFuncOff);
+    if ((cur1 != g_processInternal && cur1 != thunk1) || (cur2 != g_processInternal && cur2 != thunk2) ||
+        R<uintptr_t>(c.ubergraph + g_funcFuncOff) != g_processInternal)
+        return kRetry;  // not linked yet
+    c.origConstruct = (NativeFn)g_processInternal;
+    c.origUpdatePlayers = (NativeFn)g_processInternal;
     c.ready = true;
     g_crew = c;
-    uintptr_t thunk = (uintptr_t)&CrewConstructThunk;
-    return SafeWrite(c.constructFn + g_funcFuncOff, &thunk, 8) ? kDone : kFail;
+    return SafeWrite(c.constructFn + g_funcFuncOff, &thunk1, 8) &&
+           SafeWrite(c.updatePlayersFn + g_funcFuncOff, &thunk2, 8) ? kDone : kFail;
 }

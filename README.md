@@ -1,6 +1,11 @@
 # Species Unknown – 5 Player Mod
 
-Raises the co-op player limit from 4 to 5 and adds a 5th seat to the shuttle.
+Raises the co-op player limit from 4 to 5 and adds a 5th seat to the shuttle, **in private lobbies only**.
+
+**Private lobbies only.** Only a lobby you host as **Private** (joined with its code) gets 5 slots, the
+5th shuttle seat and the 5th Crew Members row. Public lobbies and the public server browser behave exactly like
+the unmodded game: 4 slots, 4 seats, full at 4/4. So modded and unmodded players can still play public games
+together.
 
 > [!WARNING]
 > **A game update will break this version of the mod.** It patches the game's code byte-for-byte and only
@@ -38,8 +43,9 @@ launcher in the game root. The launcher just starts the Shipping exe.)
 Also copy `FivePlayerMod.ini` there if you host (it sets where the 5th shuttle seat goes; only the
 host's copy matters).
 
-**Every player needs the mod**, not just the host. The client-side join checks and the server
-browser also read the player limit.
+**Everyone in a 5-player private lobby needs the mod**, not just the host: the 5th seat's screen, the
+5th Crew Members row, player 5's voice volume and the 5-player monster/objective values are handled on each
+player's own machine. For public lobbies the mod changes nothing, so players with and without it can mix there.
 
 To uninstall, delete `version.dll`.
 
@@ -52,16 +58,15 @@ Blueprints:
 
 | Where | Change |
 |---|---|
-| `BP_MyGameInstance.playerLobbyCapacity` | 4 → 5. This drives the EOS lobby size, session size, slot loops and the auto-kick check |
-| `BP_MyGameInstance` "Make Player Lobby Transaction" | Lobby creation also opens member slot 4 (the original only opened slots 1–3) |
-| `BP_PlayerShip.SpawnChairs` | Spawns a 5th seat. The host moves it to the offset in `FivePlayerMod.ini` (default: centred behind the back row), and its position syncs to everyone |
-| `BP_PlayerShip.SetUpChairLocal` / `SpawnChairs` | Seat 5 is included in the seat-screen updates ("No destination selected", mission pages); the list is rebuilt once all 5 seats exist |
+| `BP_MyGameInstance.playerLobbyCapacity` | 5 while you host a **private** lobby (`isPlayerLobbyPrivate`), otherwise the original 4. This drives the EOS lobby size, session size, slot loops and the auto-kick check |
+| `BP_MyGameInstance` "Make Player Lobby Transaction" | Lobby creation also opens member slot 4 (the original only opened slots 1–3; unused in 4-slot lobbies) |
+| `BP_MyGameInstance.CheckAllowConnectionLobby` | The pre-join rejoin check reads all 5 slots of the lobby being joined |
+| `BP_PlayerShip.SpawnChairs` | Private lobbies only: spawns a 5th seat. The host moves it to the offset in `FivePlayerMod.ini` (default: centred behind the back row), and its position syncs to everyone. Otherwise the original 4-seat version is used |
+| `BP_PlayerShip.SetUpChairLocal` / `SpawnChairs` | Seat-screen updates ("No destination selected", mission pages) cover every spawned seat, including seat 5; the list is rebuilt once all seats exist |
 | `BP_Seat` BeginPlay (other players) | Seat 5 is replicated without its ship link (`ParentShip` isn't replicated); the mod links it on each player's machine so its screen works there too |
-| `WBP_PauseMenu_CrewMembers` | A 5th row ("Slot 4", hot-pink colour bar) with its own mute/volume/kick controls under Slot 3. Built at runtime by calling the engine's own widget functions |
+| `WBP_PauseMenu_CrewMembers` | A 5th row ("Slot 4", hot-pink colour bar) with its own mute/volume/kick controls under Slot 3. Built at runtime by calling the engine's own widget functions. Shown only when you host a private lobby or a 5th player is present; otherwise collapsed |
 | Monsters, spawners and mission objectives (13 Blueprints, 34 switches) | Values picked by player count only had cases for 0–4 players, so 5 players got 0 (monster speed/dodge/combat ×0, spawn counts 0, keypad length 0, …). 5 players now use the 4-player values. Sentry-gun balancing (data table with 1–4 player columns) clamps the player count to 4 |
 | `BP_PlayerShip` launch checks (fallback only) | If the 5th seat could not be added, the ship launches when `min(players, 4)` are seated |
-| `UMG_SessionRow`, `UMG_SessionInfos` | Lobby shows as full at 5 instead of 4 |
-| `WBP_TitleScreen_PublicSessionPage` | Public lobby list: full at 5; reads 5 member/whitelist slots |
 | `BP_LobbyGameMode` "Check More Than 4Players" | Diagnostic threshold 4 → 5 |
 | `BP_Character_Lobby._GetPlayerStartFromId` | Player 5 spawns at the 4th lobby spawn point instead of nowhere |
 | `BP_MyPlayerController.OnPlayerEnterChat` | Per-player voice volume/mute arrays grow for player 5 (otherwise player 5 has volume 0) |
@@ -94,18 +99,24 @@ reload undid (logged as `... was reloaded; patches re-applied`).
 FNamePool blocks at ...
 GUObjectArray.ObjObjects at ...
 UStruct::Script offset = 0x..
-playerLobbyCapacity at offset 0x...
-Default__BP_MyGameInstance_C: playerLobbyCapacity 4 -> 5
-BP_MyGameInstance_C_...: playerLobbyCapacity 4 -> 5
-  5th shuttle seat: ok
+playerLobbyCapacity at offset 0x..., isPlayerLobbyPrivate at 0x...
+...
+Private lobby: 5-player mode ON
+  playerLobbyCapacity 4 -> 5
+  5th shuttle seat (private lobby): ok
 BP_PlayerShip_C patched
 ...
 ```
+
+Hosting a public lobby logs `Not a private lobby: normal 4-player mode` and `original 4 shuttle seats`.
 
 If something is wrong, the log says which step failed.
 
 ## Known limitations
 
+- 5 players only works in **private** lobbies. Hosting public gives the normal 4-player game.
+- Guests can't tell a private lobby from a public one, so on a guest's screen the 5th Crew Members row only
+  appears once a 5th player has joined (the host always sees it in a private lobby).
 - The 5th Crew Members row may not be reachable with gamepad/keyboard navigation; use the mouse.
 - 5 players get the game's 4-player difficulty values (the game has no 5-player values), so a 5-player run is
   slightly easier per player than the game's own scaling would make it.
