@@ -2,6 +2,24 @@
 
 Raises the co-op player limit from 4 to 5 and adds a 5th seat to the shuttle.
 
+> [!WARNING]
+> **A game update will break this version of the mod.** It patches the game's code byte-for-byte and only
+> works with the exact game version below. After an update the mod skips anything that no longer matches
+> (marked `FAILED` in `FivePlayerMod.log`), so the game itself keeps running, but the 5-player features stop
+> working until the mod is updated. Everyone in the group must also be on the same game version.
+
+## Requirements
+
+| | |
+|---|---|
+| Game | **Species: Unknown v0.26.8** (Steam app 2747330, **build ID 26617965**) |
+| Engine | Unreal Engine 5.7 (CL 49658320) |
+| Platform | Windows 64-bit, Steam version |
+| Players | Every player installs the mod |
+
+To check your build ID: Steam → Species: Unknown → Properties → Updates (or `buildid` in
+`steamapps\appmanifest_2747330.acf`).
+
 ## Install
 
 Download `version.dll` (and, if you host, `FivePlayerMod.ini`) from the
