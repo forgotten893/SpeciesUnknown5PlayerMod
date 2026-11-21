@@ -98,3 +98,7 @@ If something is wrong, the log says which step failed.
 
 Run `build.bat` (needs Visual Studio 2022/2026 or Build Tools with the C++ x64 toolchain). Output: `build\version.dll`.
 Source: `src\fiveplayer.cpp` (patcher), `src\dllmain.cpp` + `src\version_proxy.asm` + `src\version.def` (proxy).
+
+## License
+
+Released into the public domain under [the Unlicense](LICENSE): use, change and share it however you like, no credit needed.
