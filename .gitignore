@@ -1,0 +1,7 @@
+# Game files (copyrighted, never commit)
+game/
+# Personal test screenshots
+screenshots/
+# Build output (the DLL is published as a GitHub Release asset instead)
+build/*
+!build/FivePlayerMod.ini
